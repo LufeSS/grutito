@@ -3,8 +3,10 @@
 Run GR00T N1.5 on the original GR1 dataset (HF file-repo) and dump teacher latents + pointers.
 
 This version captures the **input to the decoder** by attaching a forward_pre_hook on the decoder
-module (so we record the tensor right before decoding). This avoids relying on internal DiT layer
-names and gives you the final DiT output that feeds the decoder.
+module (so we record the tensor right before decoding). We then drop the singleton batch dimension
+and slice the trailing action tokens, yielding exactly the latent vectors the decoder consumes when
+predicting the action trajectory. This avoids relying on internal DiT layer names and gives you the
+final DiT output that the decoder actually uses.
 
 Other key behaviors (unchanged):
 - Enumerate only top-level GR1 task dirs via HfFileSystem.ls (no deep crawl).
@@ -13,7 +15,8 @@ Other key behaviors (unchanged):
 - Construct exact parquet/mp4 paths using per-task meta/info.json templates.
 - Download only the exact parquet/mp4 we touch (HF cache).
 - Build step-wise inputs (state slices + video frame), run policy, and store latents.
-- Write per-episode .npz latents and a JSONL manifest of pointers.
+- Write per-episode .npz latents and a JSONL manifest of pointers including both the
+  original (pre-slice) sequence shape and the post-slice decoder-action dimensions.
 
 Notes:
 * Uses the correct HfFileSystem URI scheme: "hf://datasets/{repo_id}/{path}".
@@ -394,6 +397,31 @@ def run(
     hook = attach_decoder_input_hook(policy.model, preferred=decoder_module)
     print(f"[*] Decoder-input hook attached (pre-hook) at: {hook.path}")
 
+    # Give a one-time breakdown of how many tokens the decoder receives and which
+    # subset corresponds to the action latents we ultimately care about.
+    state_tokens = 0
+    try:
+        state_indices = policy.state_delta_indices
+        if state_indices is not None:
+            state_tokens = int(len(state_indices))
+    except Exception:
+        state_tokens = 0
+    future_tokens = int(getattr(policy.model.action_head.config, "num_target_vision_tokens", 0) or 0)
+    action_tokens = int(getattr(policy.model.action_head, "action_horizon", 0) or 0)
+    total_tokens = state_tokens + future_tokens + action_tokens
+    if total_tokens:
+        print(
+            "[*] Decoder expects sequence tokens: "
+            f"state={state_tokens} + future={future_tokens} + action={action_tokens}"
+            f" -> total={total_tokens}"
+        )
+        if action_tokens:
+            print(
+                "    Capturing DiT output before the decoder and slicing down to the"
+                " last action tokens so the stored latents match the decoder's actual"
+                " inputs for prediction."
+            )
+
     task_dirs = list_gr1_tasks(repo_id)
     if tasks_filter:
         rx = re.compile(tasks_filter)
@@ -567,7 +595,36 @@ def run(
                     continue
 
                 lat = hook.latest
-                latents_per_step.append(lat.to(dtype=torch.float16).cpu().numpy())
+                if not isinstance(lat, torch.Tensor):
+                    continue
+
+                # ``lat`` is the tensor fed to the action decoder and therefore has
+                # shape (batch, seq_len, hidden_size).  We keep a copy of the full
+                # sequence length for bookkeeping, but only the final ``action_horizon``
+                # tokens influence the decoded action prediction.  By dropping the
+                # singleton batch dimension and slicing to the trailing action tokens
+                # we record exactly the latent vectors the decoder consumes when
+                # producing actions.
+                lat = lat.detach()
+                original_shape = tuple(lat.shape)
+
+                if lat.dim() == 3:
+                    action_horizon = int(getattr(policy.model.action_head, "action_horizon", 0) or 0)
+                    if action_horizon and lat.shape[1] >= action_horizon:
+                        lat = lat[:, -action_horizon:, :]
+                    if lat.shape[0] == 1:
+                        lat = lat.squeeze(0)
+                elif lat.dim() == 2:
+                    action_horizon = int(getattr(policy.model.action_head, "action_horizon", 0) or 0)
+                    if action_horizon and lat.shape[0] >= action_horizon:
+                        lat = lat[-action_horizon:, :]
+
+                lat_np = lat.to(dtype=torch.float16).contiguous().cpu().numpy()
+                # Each saved array now has shape (action_horizon, hidden_size) (or
+                # (batch, action_horizon, hidden_size) if a batch dimension is present),
+                # so stacking across timesteps yields
+                # (episode_len, action_horizon, hidden_size).
+                latents_per_step.append(lat_np)
 
                 ptr = {
                     "parquet_path": parquet_rel_task,
@@ -582,6 +639,10 @@ def run(
                     "valid": int(valid_col[row_id]) if valid_col is not None else None,
                     "latent_module": hook.path,
                     "hook_kind": hook.kind,
+                    "latent_seq_len": original_shape[-2] if len(original_shape) >= 2 else None,
+                    "latent_action_tokens": lat_np.shape[-2] if lat_np.ndim >= 2 else None,
+                    "latent_hidden_size": lat_np.shape[-1] if lat_np.ndim >= 1 else None,
+                    "latent_original_shape": list(original_shape),
                 }
                 manifest_lines.append(json.dumps(ptr))
 
