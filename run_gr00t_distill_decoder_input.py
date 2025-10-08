@@ -118,7 +118,7 @@ class VideoFrameReader:
         if _HAS_DECORD:
             try:
                 import decord
-                decord.bridge.set_bridge("native")
+                decord.bridge.set_bridge("numpy")
             except Exception:
                 pass
             self._vr = decord.VideoReader(video_path)
@@ -155,7 +155,10 @@ class VideoFrameReader:
 
         if _HAS_DECORD:
             img = self._vr[frame_idx]
-            return img
+            try:
+                return img.asnumpy()
+            except AttributeError:
+                return np.asarray(img)
         elif _HAS_OPENCV:
             self._cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
             ok, frame_bgr = self._cap.read()
