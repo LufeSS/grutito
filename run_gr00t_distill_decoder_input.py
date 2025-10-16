@@ -31,7 +31,7 @@ import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -280,6 +280,295 @@ def attach_decoder_input_hook(model: torch.nn.Module, preferred: Optional[str] =
 # Episode iteration + packing
 # ---------------------------
 
+
+@dataclass
+class EpisodeSample:
+    episode_index: int
+    episode_chunk: int
+    parquet_rel_task: str
+    video_rel_task: str
+    columns: Dict[str, Optional[np.ndarray]]
+    length: int
+    fps: float
+    video_reader: Optional[VideoFrameReader]
+    latent_path: Path
+    meta_path: Path
+
+
+@dataclass
+class EpisodeWorkItem:
+    sample: EpisodeSample
+    latents_per_step: List[np.ndarray]
+    manifest_lines: List[str]
+
+
+class EpisodeDataset(torch.utils.data.Dataset):  # type: ignore[misc]
+    def __init__(self, samples: Sequence[EpisodeSample]):
+        self._samples = list(samples)
+
+    def __len__(self) -> int:
+        return len(self._samples)
+
+    def __getitem__(self, idx: int) -> EpisodeSample:
+        return self._samples[idx]
+
+
+def collate_episode_steps(steps: Sequence[Dict[str, np.ndarray]]) -> Dict[str, np.ndarray]:
+    if not steps:
+        return {}
+    common_keys = set(steps[0].keys())
+    for step in steps[1:]:
+        common_keys &= set(step.keys())
+    batched: Dict[str, np.ndarray] = {}
+    for key in sorted(common_keys):
+        arrays = [step[key] for step in steps]
+        if not arrays:
+            continue
+        try:
+            batched[key] = np.concatenate(arrays, axis=0)
+        except ValueError:
+            batched[key] = np.stack(arrays, axis=0)
+    return batched
+
+
+def prepare_episode_step(
+    sample: EpisodeSample,
+    row_id: int,
+    modality: dict,
+    task_text_map: Dict[int, str],
+    require_video: bool,
+) -> Optional[Tuple[Dict[str, np.ndarray], Dict[str, Any]]]:
+    state_col = sample.columns.get("observation.state")
+    ts_col = sample.columns.get("timestamp")
+    task_idx_col = sample.columns.get("task_index")
+    desc_col = sample.columns.get("annotation.human.action.task_description")
+    valid_col = sample.columns.get("annotation.human.validity")
+
+    state_vec = (
+        np.array(state_col[row_id], dtype=np.float32) if state_col is not None else None
+    )
+    ts = float(ts_col[row_id]) if ts_col is not None else float(row_id) / sample.fps
+
+    if state_vec is None or state_vec.shape[0] < 44:
+        return None
+
+    step = slice_state_action(state_vec, None, modality)
+
+    frame_idx = frame_index_from_timestamp(
+        ts, sample.video_reader.fps if (sample.video_reader and sample.video_reader.fps) else sample.fps
+    )
+    if sample.video_reader is not None:
+        try:
+            img = sample.video_reader.get_frame(frame_idx)
+            step["video.ego_view"] = img[None, ...]
+        except Exception as e:
+            if require_video:
+                print(
+                    f"    ! Failed to read frame {frame_idx} in {sample.video_rel_task}: {e}"
+                )
+                return None
+    if "video.ego_view" not in step:
+        if require_video:
+            return None
+        try:
+            if sample.video_reader is not None:
+                probe = sample.video_reader.get_frame(0)
+                h, w = int(probe.shape[0]), int(probe.shape[1])
+            else:
+                h, w = 256, 256
+        except Exception:
+            h, w = 256, 256
+        step["video.ego_view"] = np.zeros((1, h, w, 3), dtype=np.uint8)
+
+    desc_id = None
+    if desc_col is not None:
+        try:
+            desc_id = int(desc_col[row_id])
+            if desc_id in task_text_map:
+                step["annotation.human.action.task_description"] = np.array([desc_id], dtype=np.int64)
+        except Exception:
+            desc_id = None
+
+    task_idx_val = None
+    if task_idx_col is not None:
+        try:
+            task_idx_val = int(task_idx_col[row_id])
+            step["task_index"] = np.array([task_idx_val], dtype=np.int64)
+        except Exception:
+            task_idx_val = None
+
+    valid_val = None
+    if valid_col is not None:
+        try:
+            valid_val = int(valid_col[row_id])
+            step["annotation.human.validity"] = np.array([valid_val], dtype=np.int64)
+        except Exception:
+            valid_val = None
+
+    meta = {
+        "row_id": int(row_id),
+        "timestamp": ts,
+        "frame_idx": int(frame_idx),
+        "task_index": task_idx_val,
+        "task_desc_id": desc_id,
+        "valid": valid_val,
+    }
+
+    return step, meta
+
+
+def process_latent_tensor(policy, lat: torch.Tensor) -> Tuple[np.ndarray, Tuple[int, ...]]:
+    lat = lat.detach()
+    original_shape = tuple(lat.shape)
+
+    action_horizon = int(getattr(policy.model.action_head, "action_horizon", 0) or 0)
+
+    if lat.dim() == 3:
+        if action_horizon and lat.shape[1] >= action_horizon:
+            lat = lat[:, -action_horizon:, :]
+    elif lat.dim() == 2:
+        if action_horizon and lat.shape[0] >= action_horizon:
+            lat = lat[-action_horizon:, :]
+
+    lat_np = lat.to(dtype=torch.float16).contiguous().cpu().numpy()
+    return lat_np, original_shape
+
+
+def run_episode_batch(
+    samples: Sequence[EpisodeSample],
+    policy,
+    hook: LatentHook,
+    modality: dict,
+    task_text_map: Dict[int, str],
+    require_video: bool,
+    batch_size: int,
+) -> int:
+    if not samples:
+        return 0
+
+    dataset = EpisodeDataset(samples)
+    loader = torch.utils.data.DataLoader(  # type: ignore[attr-defined]
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        collate_fn=lambda batch: batch,
+    )
+
+    completed = 0
+
+    for batch in loader:
+        if not batch:
+            continue
+        work_items = [EpisodeWorkItem(sample=s, latents_per_step=[], manifest_lines=[]) for s in batch]
+        max_rows = max(item.sample.length for item in work_items)
+
+        for row_id in range(max_rows):
+            steps: List[Dict[str, np.ndarray]] = []
+            meta_records: List[Tuple[EpisodeWorkItem, Dict[str, Any]]] = []
+            for item in work_items:
+                if row_id >= item.sample.length:
+                    continue
+                prepared = prepare_episode_step(
+                    item.sample,
+                    row_id,
+                    modality,
+                    task_text_map,
+                    require_video,
+                )
+                if prepared is None:
+                    continue
+                step_dict, meta = prepared
+                steps.append(step_dict)
+                meta_records.append((item, meta))
+
+            if not steps:
+                continue
+
+            batched_inputs = collate_episode_steps(steps)
+            if not batched_inputs:
+                continue
+
+            with torch.no_grad():
+                _ = policy.get_action(batched_inputs)
+
+            lat_tensor = getattr(hook, "latest", None)
+            if not isinstance(lat_tensor, torch.Tensor):
+                continue
+
+            if lat_tensor.dim() >= 3:
+                lat_splits = list(torch.unbind(lat_tensor, dim=0))
+            elif lat_tensor.dim() == 2:
+                lat_splits = [lat_tensor]
+            else:
+                lat_splits = []
+
+            if len(lat_splits) != len(meta_records):
+                lat_splits = lat_splits[: len(meta_records)]
+
+            for (item, meta), lat_part in zip(meta_records, lat_splits):
+                lat_np, original_shape = process_latent_tensor(policy, lat_part)
+                item.latents_per_step.append(lat_np)
+                ptr = {
+                    "parquet_path": item.sample.parquet_rel_task,
+                    "row_id": meta["row_id"],
+                    "timestamp": meta["timestamp"],
+                    "video_path": item.sample.video_rel_task,
+                    "video_frame_index": meta["frame_idx"],
+                    "episode_index": item.sample.episode_index,
+                    "episode_chunk": item.sample.episode_chunk,
+                    "task_index": meta.get("task_index"),
+                    "task_desc_id": meta.get("task_desc_id"),
+                    "valid": meta.get("valid"),
+                    "latent_module": hook.path,
+                    "hook_kind": hook.kind,
+                    "latent_seq_len": original_shape[-2] if len(original_shape) >= 2 else None,
+                    "latent_action_tokens": lat_np.shape[-2] if lat_np.ndim >= 2 else None,
+                    "latent_hidden_size": lat_np.shape[-1] if lat_np.ndim >= 1 else None,
+                    "latent_original_shape": list(original_shape),
+                }
+                item.manifest_lines.append(json.dumps(ptr))
+
+        for item in work_items:
+            if not item.latents_per_step:
+                print(
+                    f"  - Episode {item.sample.episode_index:06d}: no latents captured; skipping save."
+                )
+                continue
+
+            same_shape = len({tuple(arr.shape) for arr in item.latents_per_step}) == 1
+
+            if same_shape:
+                lat_arr = np.stack(item.latents_per_step, axis=0)
+                np.savez_compressed(
+                    item.sample.latent_path,
+                    latents=lat_arr,
+                    module=hook.path,
+                    dtype=str(lat_arr.dtype),
+                )
+            else:
+                obj = np.empty((len(item.latents_per_step),), dtype=object)
+                for i, arr in enumerate(item.latents_per_step):
+                    obj[i] = arr
+                np.savez_compressed(
+                    item.sample.latent_path,
+                    latents=obj,
+                    module=hook.path,
+                    ragged=True,
+                )
+
+            with open(item.sample.meta_path, "w", encoding="utf-8") as f:
+                for line in item.manifest_lines:
+                    f.write(line + "\n")
+
+            print(
+                "  + Episode "
+                f"{item.sample.episode_index:06d}: wrote latents -> {item.sample.latent_path.name}"
+                f"  | meta -> {item.sample.meta_path.name}"
+            )
+            completed += 1
+
+    return completed
+
 def make_paths(info_json: dict, modality_json: dict, episode_index: int, episode_chunk: int) -> Tuple[str, str]:
     data_tpl = info_json["data_path"]
     video_tpl = info_json["video_path"]
@@ -387,6 +676,7 @@ def run(
     decoder_module: Optional[str] = None,
     require_video: bool = True,
     save_every: int = 1,
+    batch_size: int = 1,
 ):
     t0 = time.time()
 
@@ -466,6 +756,7 @@ def run(
             continue
 
         ep_count = 0
+        pending_samples: List[EpisodeSample] = []
         for rec in episodes_iter:
             try:
                 episode_index = int(rec.get("episode_index"))
@@ -473,6 +764,9 @@ def run(
                 continue
             if episode_index < start_at_episode:
                 continue
+
+            if max_episodes_per_task is not None and ep_count >= max_episodes_per_task:
+                break
 
             raw_chunk = rec.get("episode_chunk", None)
             if raw_chunk is not None:
@@ -526,152 +820,64 @@ def run(
             table = pf.read()
             cols = {name: table[name].to_numpy() for name in table.column_names}
 
-            state_col = cols.get("observation.state")
-            action_col = cols.get("action")
-            ts_col = cols.get("timestamp")
-            task_idx_col = cols.get("task_index")
-            desc_col = cols.get("annotation.human.action.task_description")
-            valid_col = cols.get("annotation.human.validity")
+            sample = EpisodeSample(
+                episode_index=episode_index,
+                episode_chunk=episode_chunk,
+                parquet_rel_task=parquet_rel_task,
+                video_rel_task=video_rel_task,
+                columns=cols,
+                length=len(table),
+                fps=fps,
+                video_reader=vr,
+                latent_path=lat_out,
+                meta_path=meta_out,
+            )
 
-            latents_per_step: List[np.ndarray] = []
-            manifest_lines: List[str] = []
+            pending_samples.append(sample)
 
-            n_rows = len(table)
-            for row_id in range(n_rows):
-                state_vec = np.array(state_col[row_id], dtype=np.float32) if state_col is not None else None
-                action_vec = np.array(action_col[row_id], dtype=np.float32) if action_col is not None else None
-                ts = float(ts_col[row_id]) if ts_col is not None else float(row_id) / fps
+            allowed_remaining = (
+                max_episodes_per_task - ep_count if max_episodes_per_task is not None else None
+            )
+            should_flush = len(pending_samples) >= batch_size
+            if allowed_remaining is not None and allowed_remaining <= len(pending_samples):
+                should_flush = True
 
-                if state_vec is None or state_vec.shape[0] < 44:
-                    continue
+            if should_flush:
+                to_run: Sequence[EpisodeSample]
+                if allowed_remaining is not None:
+                    allowed = max(0, allowed_remaining)
+                    to_run = pending_samples[:allowed]
+                else:
+                    to_run = pending_samples
 
-                step = slice_state_action(state_vec, None, modality)
+                if to_run:
+                    completed = run_episode_batch(
+                        to_run,
+                        policy,
+                        hook,
+                        modality,
+                        task_text_map,
+                        require_video,
+                        batch_size,
+                    )
+                    ep_count += completed
+                    pending_samples = pending_samples[len(to_run) :]
 
-                frame_idx = frame_index_from_timestamp(ts, vr.fps if (vr and vr.fps) else fps)
-                if vr is not None:
-                    try:
-                        img = vr.get_frame(frame_idx)
-                        step["video.ego_view"] = img[None, ...]
-                    except Exception as e:
-                        if require_video:
-                            print(f"    ! Failed to read frame {frame_idx} in {video_rel_task}: {e}")
-                            continue
-
-                if "video.ego_view" not in step:
-                    if require_video:
-                        continue
-                    else:
-                        try:
-                            if vr is not None:
-                                _probe = vr.get_frame(0)
-                                _h, _w = int(_probe.shape[0]), int(_probe.shape[1])
-                            else:
-                                _h, _w = 256, 256
-                        except Exception:
-                            _h, _w = 256, 256
-                        step["video.ego_view"] = np.zeros((1, _h, _w, 3), dtype=np.uint8)
-
-                if desc_col is not None:
-                    try:
-                        desc_id = int(desc_col[row_id])
-                        if desc_id in task_text_map:
-                            step["annotation.human.action.task_description"] = np.array([desc_id], dtype=np.int64)
-                    except Exception:
-                        pass
-
-                if task_idx_col is not None:
-                    try:
-                        step["task_index"] = np.array([int(task_idx_col[row_id])], dtype=np.int64)
-                    except Exception:
-                        pass
-
-                if valid_col is not None:
-                    try:
-                        step["annotation.human.validity"] = np.array([int(valid_col[row_id])], dtype=np.int64)
-                    except Exception:
-                        pass
-
-                with torch.no_grad():
-                    _ = policy.get_action(step)
-
-                if not isinstance(getattr(hook, "latest", None), torch.Tensor):
-                    continue
-
-                lat = hook.latest
-                if not isinstance(lat, torch.Tensor):
-                    continue
-
-                # ``lat`` is the tensor fed to the action decoder and therefore has
-                # shape (batch, seq_len, hidden_size).  We keep a copy of the full
-                # sequence length for bookkeeping, but only the final ``action_horizon``
-                # tokens influence the decoded action prediction.  By dropping the
-                # singleton batch dimension and slicing to the trailing action tokens
-                # we record exactly the latent vectors the decoder consumes when
-                # producing actions.
-                lat = lat.detach()
-                original_shape = tuple(lat.shape)
-
-                if lat.dim() == 3:
-                    action_horizon = int(getattr(policy.model.action_head, "action_horizon", 0) or 0)
-                    if action_horizon and lat.shape[1] >= action_horizon:
-                        lat = lat[:, -action_horizon:, :]
-                    if lat.shape[0] == 1:
-                        lat = lat.squeeze(0)
-                elif lat.dim() == 2:
-                    action_horizon = int(getattr(policy.model.action_head, "action_horizon", 0) or 0)
-                    if action_horizon and lat.shape[0] >= action_horizon:
-                        lat = lat[-action_horizon:, :]
-
-                lat_np = lat.to(dtype=torch.float16).contiguous().cpu().numpy()
-                # Each saved array now has shape (action_horizon, hidden_size) (or
-                # (batch, action_horizon, hidden_size) if a batch dimension is present),
-                # so stacking across timesteps yields
-                # (episode_len, action_horizon, hidden_size).
-                latents_per_step.append(lat_np)
-
-                ptr = {
-                    "parquet_path": parquet_rel_task,
-                    "row_id": int(row_id),
-                    "timestamp": ts,
-                    "video_path": video_rel_task,
-                    "video_frame_index": int(frame_idx),
-                    "episode_index": episode_index,
-                    "episode_chunk": episode_chunk,
-                    "task_index": int(task_idx_col[row_id]) if task_idx_col is not None else None,
-                    "task_desc_id": int(desc_col[row_id]) if desc_col is not None else None,
-                    "valid": int(valid_col[row_id]) if valid_col is not None else None,
-                    "latent_module": hook.path,
-                    "hook_kind": hook.kind,
-                    "latent_seq_len": original_shape[-2] if len(original_shape) >= 2 else None,
-                    "latent_action_tokens": lat_np.shape[-2] if lat_np.ndim >= 2 else None,
-                    "latent_hidden_size": lat_np.shape[-1] if lat_np.ndim >= 1 else None,
-                    "latent_original_shape": list(original_shape),
-                }
-                manifest_lines.append(json.dumps(ptr))
-
-            if not latents_per_step:
-                print(f"  - Episode {episode_index:06d}: no latents captured; skipping save.")
-                continue
-
-            same_shape = len({tuple(x.shape) for x in latents_per_step}) == 1
-            lat_out = out_lat / f"episode_{episode_index:06d}.npz"
-            meta_out = out_meta / f"episode_{episode_index:06d}.jsonl"
-
-            if same_shape:
-                lat_arr = np.stack(latents_per_step, axis=0)
-                np.savez_compressed(lat_out, latents=lat_arr, module=hook.path, dtype=str(lat_arr.dtype))
-            else:
-                obj = np.empty((len(latents_per_step),), dtype=object)
-                for i, arr in enumerate(latents_per_step):
-                    obj[i] = arr
-                np.savez_compressed(lat_out, latents=obj, module=hook.path, ragged=True)
-
-            with open(meta_out, "w", encoding="utf-8") as f:
-                for line in manifest_lines:
-                    f.write(line + "\n")
-
-            print(f"  + Episode {episode_index:06d}: wrote latents -> {lat_out.name}  | meta -> {meta_out.name}")
-            ep_count += 1
+        if pending_samples and (max_episodes_per_task is None or ep_count < max_episodes_per_task):
+            remaining = pending_samples[:]
+            if max_episodes_per_task is not None:
+                remaining = remaining[: max(0, max_episodes_per_task - ep_count)]
+            completed = run_episode_batch(
+                remaining,
+                policy,
+                hook,
+                modality,
+                task_text_map,
+                require_video,
+                batch_size,
+            )
+            ep_count += completed
+            pending_samples = []
 
     if hook.handle is not None:
         hook.handle.remove()
@@ -691,6 +897,12 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--decoder-module", default=None, help="Exact module path to attach pre-hook (optional)")
     p.add_argument("--require-video", action="store_true", help="Require video frames (skip episode if video missing)")
     p.add_argument("--save-every", type=int, default=1, help="Flush cadence (reserved)")
+    p.add_argument(
+        "--batch-size",
+        type=int,
+        default=1,
+        help="Number of episodes to process concurrently (per forward pass batch)",
+    )
     return p.parse_args(argv)
 
 
@@ -707,4 +919,5 @@ if __name__ == "__main__":
         decoder_module=args.decoder_module,
         require_video=args.require_video,
         save_every=args.save_every,
+        batch_size=max(1, args.batch_size),
     )
