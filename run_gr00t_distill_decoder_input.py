@@ -321,13 +321,40 @@ def collate_episode_steps(steps: Sequence[Dict[str, np.ndarray]]) -> Dict[str, n
         common_keys &= set(step.keys())
     batched: Dict[str, np.ndarray] = {}
     for key in sorted(common_keys):
-        arrays = [step[key] for step in steps]
+        arrays = [np.asarray(step[key]) for step in steps if key in step]
         if not arrays:
             continue
-        try:
-            batched[key] = np.concatenate(arrays, axis=0)
-        except ValueError:
-            batched[key] = np.stack(arrays, axis=0)
+
+        # Normalize rank so every array has the same number of dimensions.
+        max_ndim = max(arr.ndim for arr in arrays)
+        normalized: List[np.ndarray] = []
+        for arr in arrays:
+            if arr.ndim < max_ndim:
+                arr = arr.reshape(arr.shape + (1,) * (max_ndim - arr.ndim))
+            normalized.append(arr)
+
+        target_shape = tuple(max(arr.shape[dim] for arr in normalized) for dim in range(max_ndim))
+
+        padded: List[np.ndarray] = []
+        for arr in normalized:
+            pad_width = []
+            for dim, (cur, target) in enumerate(zip(arr.shape, target_shape)):
+                if cur > target:
+                    # Truncate extras if we somehow have a longer array.
+                    sl = [slice(None)] * arr.ndim
+                    sl[dim] = slice(0, target)
+                    arr = arr[tuple(sl)]
+                    cur = target
+                if cur < target:
+                    pad = (0, target - cur)
+                else:
+                    pad = (0, 0)
+                pad_width.append(pad)
+            if any(pad != (0, 0) for pad in pad_width):
+                arr = np.pad(arr, pad_width, mode="constant")
+            padded.append(arr)
+
+        batched[key] = np.stack(padded, axis=0)
     return batched
 
 
