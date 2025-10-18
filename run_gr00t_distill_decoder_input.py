@@ -280,12 +280,78 @@ def attach_decoder_input_hook(model: torch.nn.Module, preferred: Optional[str] =
 # Episode iteration + packing
 # ---------------------------
 
-def make_paths(info_json: dict, modality_json: dict, episode_index: int, episode_chunk: int) -> Tuple[str, str]:
+def get_video_key_candidates(modality_json: dict, override: Optional[str] = None) -> List[str]:
+    candidates: List[str] = []
+    if override:
+        candidates.append(override)
+
+    front_view = modality_json.get("video", {}).get("front_view", {})
+    for field in ("original_key", "key", "path"):
+        val = front_view.get(field)
+        if isinstance(val, str):
+            candidates.append(val)
+
+    # Provide sensible fallbacks.
+    candidates.append("observation.images.front_view")
+    candidates.append("observation.images.ego_view")
+
+    seen = set()
+    ordered: List[str] = []
+    for cand in candidates:
+        if not cand or cand in seen:
+            continue
+        ordered.append(cand)
+        seen.add(cand)
+    return ordered
+
+
+def resolve_video_key_for_task(
+    repo_id: str,
+    task: str,
+    info_json: dict,
+    modality_json: dict,
+    override: Optional[str] = None,
+) -> str:
+    candidates = get_video_key_candidates(modality_json, override=override)
+    if not candidates:
+        return "observation.images.front_view"
+
+    fs = HfFileSystem()
+    base = f"hf://datasets/{repo_id}/{task}/videos"
+
+    try:
+        items = fs.ls(base, detail=True)
+    except Exception:
+        return candidates[0]
+
+    chunk_dirs = [
+        Path(it["name"]).name
+        for it in items
+        if isinstance(it, dict) and it.get("type") == "directory"
+    ]
+
+    for cand in candidates:
+        for chunk_name in chunk_dirs:
+            try:
+                children = fs.ls(f"{base}/{chunk_name}", detail=True)
+            except Exception:
+                continue
+            dir_names = {
+                Path(child["name"]).name
+                for child in children
+                if isinstance(child, dict) and child.get("type") == "directory"
+            }
+            if cand in dir_names:
+                return cand
+
+    return candidates[0]
+
+
+def make_paths(info_json: dict, episode_index: int, episode_chunk: int, video_key: str) -> Tuple[str, str]:
     data_tpl = info_json["data_path"]
     video_tpl = info_json["video_path"]
-    ego_key = modality_json.get("video", {}).get("front_view", {}).get("original_key", "observation.images.front_view")
     parquet_rel = data_tpl.format(episode_chunk=episode_chunk, episode_index=episode_index)
-    video_rel = video_tpl.format(episode_chunk=episode_chunk, episode_index=episode_index, video_key=ego_key)
+    video_rel = video_tpl.format(episode_chunk=episode_chunk, episode_index=episode_index, video_key=video_key)
     return parquet_rel, video_rel
 
 
@@ -345,31 +411,41 @@ def find_chunk_for_parquet(repo_id: str, task: str, info_json: dict, episode_ind
     return None
 
 
-def find_chunk_for_video(repo_id: str, task: str, info_json: dict, modality_json: dict, episode_index: int) -> Optional[int]:
+def find_chunk_for_video(
+    repo_id: str,
+    task: str,
+    info_json: dict,
+    episode_index: int,
+    video_keys: List[str],
+) -> Tuple[Optional[int], Optional[str]]:
     fs = HfFileSystem()
     base = f"hf://datasets/{repo_id}/{task}/videos"
     try:
         items = fs.ls(base, detail=True)
     except Exception:
-        return None
+        return None, None
     chunk_dirs = sorted(
         Path(it["name"]).name for it in items
         if isinstance(it, dict) and it.get("type") == "directory" and Path(it["name"]).name.startswith("chunk-")
     )
-    ego_key = modality_json.get("video", {}).get("front_view", {}).get("original_key", "observation.images.front_view")
     for chunk_name in chunk_dirs:
         try:
             chunk_num = int(chunk_name.split("-")[1])
         except Exception:
             continue
         video_tpl = info_json["video_path"]
-        candidate_rel = video_tpl.format(episode_chunk=chunk_num, episode_index=episode_index, video_key=ego_key)
-        try:
-            HfFileSystem().info(f"hf://datasets/{repo_id}/{task}/{candidate_rel}")
-            return chunk_num
-        except Exception:
-            continue
-    return None
+        for video_key in video_keys:
+            candidate_rel = video_tpl.format(
+                episode_chunk=chunk_num,
+                episode_index=episode_index,
+                video_key=video_key,
+            )
+            try:
+                HfFileSystem().info(f"hf://datasets/{repo_id}/{task}/{candidate_rel}")
+                return chunk_num, video_key
+            except Exception:
+                continue
+    return None, None
 
 
 # ---------------------------
@@ -386,6 +462,7 @@ def run(
     start_at_episode: int = 0,
     decoder_module: Optional[str] = None,
     require_video: bool = True,
+    video_key_override: Optional[str] = None,
     save_every: int = 1,
 ):
     t0 = time.time()
@@ -459,6 +536,32 @@ def run(
         ensure_dir(out_lat)
         ensure_dir(out_meta)
 
+        video_key_candidates = get_video_key_candidates(modality, override=video_key_override)
+        initial_preference = video_key_candidates[0] if video_key_candidates else None
+        resolved_video_key = resolve_video_key_for_task(
+            repo_id,
+            task,
+            info,
+            modality,
+            override=video_key_override,
+        )
+        if resolved_video_key not in video_key_candidates:
+            video_key_candidates.insert(0, resolved_video_key)
+        video_key_order = [resolved_video_key] + [k for k in video_key_candidates if k != resolved_video_key]
+        if not video_key_order:
+            video_key_order = ["observation.images.front_view"]
+
+        if video_key_override:
+            print(f"  > Using video key override: {resolved_video_key}")
+        elif initial_preference and resolved_video_key != initial_preference:
+            print(
+                "  > Video key '"
+                f"{initial_preference}"
+                "' unavailable; using '"
+                f"{resolved_video_key}"
+                "' instead."
+            )
+
         try:
             episodes_iter = iter_jsonl_from_repo(repo_id, f"{task}/meta/episodes.jsonl")
         except Exception as e:
@@ -479,7 +582,15 @@ def run(
                 episode_chunk = int(raw_chunk)
             else:
                 epc_data = find_chunk_for_parquet(repo_id, task, info, episode_index)
-                epc_vid  = find_chunk_for_video(repo_id, task, info, modality, episode_index)
+                epc_vid, detected_key = find_chunk_for_video(
+                    repo_id,
+                    task,
+                    info,
+                    episode_index,
+                    video_key_order,
+                )
+                if detected_key is not None and detected_key != video_key_order[0]:
+                    video_key_order = [detected_key] + [k for k in video_key_order if k != detected_key]
                 if epc_data is not None:
                     episode_chunk = epc_data
                 elif epc_vid is not None:
@@ -487,10 +598,12 @@ def run(
                 else:
                     episode_chunk = 0
 
-            parquet_rel, video_rel = make_paths(info, modality, episode_index, episode_chunk)
-            parquet_rel_task = f"{task}/{parquet_rel}"
-            video_rel_task   = f"{task}/{video_rel}"
+            if not video_key_order:
+                video_key_order = ["observation.images.front_view"]
 
+            first_key = video_key_order[0]
+            parquet_rel, _ = make_paths(info, episode_index, episode_chunk, first_key)
+            parquet_rel_task = f"{task}/{parquet_rel}"
             if max_episodes_per_task is not None and ep_count >= max_episodes_per_task:
                 break
 
@@ -507,21 +620,53 @@ def run(
                 print(f"  ! Failed to load parquet {parquet_rel_task}: {e}")
                 continue
 
+            video_rel = None
+            video_rel_task = None
+            video_download_error: Optional[Tuple[str, Exception]] = None
             vr = None
-            if require_video:
+
+            for idx, candidate_key in enumerate(video_key_order):
+                _, candidate_video_rel = make_paths(
+                    info,
+                    episode_index,
+                    episode_chunk,
+                    candidate_key,
+                )
+                candidate_task_rel = f"{task}/{candidate_video_rel}"
+                video_rel = candidate_video_rel
+                video_rel_task = candidate_task_rel
                 try:
-                    video_local = hf_download(repo_id, video_rel_task)
+                    video_local = hf_download(repo_id, candidate_task_rel)
                     vr = VideoFrameReader(video_local, fps_hint=fps)
+                    if idx != 0:
+                        video_key_order = [candidate_key] + [k for k in video_key_order if k != candidate_key]
+                    break
                 except Exception as e:
-                    print(f"  ! Failed to prepare video {video_rel_task}: {e}")
-                    print("    -> Skipping episode (video required).")
+                    video_download_error = (candidate_task_rel, e)
                     continue
-            else:
-                try:
-                    video_local = hf_download(repo_id, video_rel_task)
-                    vr = VideoFrameReader(video_local, fps_hint=fps)
-                except Exception:
-                    vr = None
+
+            if video_rel is None:
+                _, fallback_video_rel = make_paths(info, episode_index, episode_chunk, video_key_order[0])
+                video_rel = fallback_video_rel
+                video_rel_task = f"{task}/{fallback_video_rel}"
+
+            if vr is None and require_video:
+                if video_download_error is not None:
+                    fail_path, fail_exc = video_download_error
+                    print(f"  ! Failed to prepare video {fail_path}: {fail_exc}")
+                else:
+                    print(
+                        f"  ! Failed to prepare video {video_rel_task}: unable to locate a valid video key"
+                    )
+                if len(video_key_order) > 1:
+                    print("    -> Tried video keys: " + ", ".join(video_key_order))
+                print("    -> Skipping episode (video required).")
+                continue
+
+            if vr is None and video_download_error is not None:
+                video_rel_task = video_download_error[0]
+                if video_rel_task.startswith(f"{task}/"):
+                    video_rel = video_rel_task.split(f"{task}/", 1)[1]
 
             table = pf.read()
             cols = {name: table[name].to_numpy() for name in table.column_names}
@@ -690,6 +835,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--start-at-episode", type=int, default=0, help="Skip episodes < this index")
     p.add_argument("--decoder-module", default=None, help="Exact module path to attach pre-hook (optional)")
     p.add_argument("--require-video", action="store_true", help="Require video frames (skip episode if video missing)")
+    p.add_argument(
+        "--video-key",
+        default=None,
+        help="Override the video modality key (e.g., observation.images.front_view)",
+    )
     p.add_argument("--save-every", type=int, default=1, help="Flush cadence (reserved)")
     return p.parse_args(argv)
 
@@ -706,5 +856,6 @@ if __name__ == "__main__":
         start_at_episode=args.start_at_episode,
         decoder_module=args.decoder_module,
         require_video=args.require_video,
+        video_key_override=args.video_key,
         save_every=args.save_every,
     )
